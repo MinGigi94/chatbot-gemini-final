@@ -1,83 +1,88 @@
 from flask import Flask, request, jsonify
 import os
-from dotenv import load_dotenv
-from google import genai
+from google import genai 
 import logging
 
-# Configuración de Logging para ver más detalles
+# Configurar logging para ver errores en los logs de Render
 logging.basicConfig(level=logging.INFO)
 
-# 1. Cargar la API Key y configurar Flask
-load_dotenv()
 app = Flask(__name__)
 
-# Inicializar el cliente con la clave de Gemini
-# Nota: La clave se carga automáticamente desde las variables de entorno si se llama a load_dotenv()
-try:
-    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-    if not client:
-        logging.error("GEMINI_API_KEY no se pudo inicializar. Verifica tu archivo .env.")
-except Exception as e:
-    logging.error(f"Error al inicializar el cliente Gemini: {e}")
+# OBTENER la clave de API de la variable de entorno de Render
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    logging.error("FATAL: La variable de entorno GEMINI_API_KEY no está configurada en Render.")
+    client = None
+else:
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    logging.info("Webhook recibido.")
-    
-    # 2. Extraer mensaje del usuario desde Dialogflow de forma segura
-    req = request.get_json(silent=True, force=True)
-    
-    # Intenta obtener el queryText desde la estructura correcta de Dialogflow ES
-    try:
-        query_result = req.get('queryResult', {})
-        user_message = query_result.get('queryText', '')
-        
-        # También verificamos la respuesta del intent de fallback para mayor robustez
-        if not user_message:
-            logging.error("No se pudo extraer queryText. Verificando alternativas...")
-            # En algunos casos, Dialogflow envía el texto en la entrada de la sesión
-            user_message = req.get('originalDetectIntentRequest', {}).get('payload', {}).get('data', {}).get('text', '')
-        
-        if not user_message:
-            logging.error("El mensaje de usuario es nulo o vacío.")
-            return jsonify({"fulfillmentText": "Lo siento, no pude entender tu mensaje."})
-
-    except Exception as e:
-        logging.error(f"Error al procesar JSON de Dialogflow: {e}")
-        return jsonify({"fulfillmentText": "Error interno del servidor al procesar tu solicitud."})
-    
-    logging.info(f"Mensaje de usuario extraído: {user_message}")
-
-    # 3. Prompt y llamada a la API de Google Gemini
-    system_prompt = (
-        "Eres un chatbot experto en Inteligencia Artificial Generativa. "
-        "Explicas conceptos de forma clara, profesional y amigable."
-    )
+    # 1. Verificar si el cliente de Gemini se inicializó
+    if client is None:
+        logging.warning("El cliente de Gemini no está inicializado. Error de configuración de API Key.")
+        # Usamos el formato estricto de Dialogflow para el error
+        return jsonify({
+            "fulfillmentMessages": [{
+                "text": { "text": ["Lo siento, el servicio de IA no está configurado correctamente (Error de API Key)."] }
+            }]
+        }), 500
 
     try:
+        req = request.get_json(silent=True, force=True) # Uso silent=True, force=True para mayor robustez
+        
+        # Extraer el texto de la consulta del usuario
+        # Dialogflow usa 'queryText' para el texto literal
+        user_message = req.get('queryResult', {}).get('queryText', '')
+        
+        if not user_message:
+            logging.warning("Mensaje de usuario vacío recibido.")
+            return jsonify({
+                 "fulfillmentMessages": [{
+                    "text": { "text": ["Por favor, dime qué quieres preguntar sobre IA."] }
+                }]
+            })
+
+        # Prompt base
+        system_prompt = (
+            "Eres un chatbot experto en Inteligencia Artificial Generativa. "
+            "Explicas conceptos de forma clara, profesional y amigable. "
+            "Responde en español."
+        )
+
+        # 3. Llamada a la API de Google Gemini
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=user_message,
             config={
                 "system_instruction": system_prompt,
-                "temperature": 0.7
+                "temperature": 0.7 
             }
         )
 
-        # 4. Extracción de la respuesta
         answer = response.text
         logging.info("Respuesta de Gemini generada con éxito.")
 
-    except Exception as e:
-        logging.error(f"Error en la llamada a la API de Gemini: {e}")
-        answer = "Lo siento, hubo un error al conectar con Gemini."
+        # 4. Devolver respuesta a Dialogflow (¡FORMATO ESTRICTO!)
+        # Usamos fulfillmentMessages con una lista de textos. 
+        # Este formato es el más compatible y evita el "Not available".
+        return jsonify({
+            "fulfillmentMessages": [{
+                "text": { "text": [answer] }
+            }]
+        })
 
-    # 5. Devolver la respuesta a Dialogflow (el formato más simple y seguro)
-    return jsonify({
-        "fulfillmentText": answer
-    })
+    except Exception as e:
+        logging.error(f"Error inesperado durante la ejecución: {e}", exc_info=True)
+        # Devolver un error amigable a Dialogflow si falla la llamada
+        return jsonify({
+            "fulfillmentMessages": [{
+                "text": { "text": [f"Lo siento, ocurrió un error interno al contactar a la IA: {e}"] }
+            }]
+        }), 500 # Devolvemos un código de error interno 500
+
 
 if __name__ == "__main__":
-    # Asegúrate de que el puerto 5000 esté libre
-    # El host '0.0.0.0' permite que Serveo se conecte correctamente desde fuera
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=True)
